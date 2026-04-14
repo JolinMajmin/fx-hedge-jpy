@@ -26,7 +26,7 @@ Three intraday decision points per day:
 - **16:00 UTC** — London/NY overlap
 
 ## Pipeline
-Stage 1 (external): usdjpy_pipeline_creator.py  →  usdjpy_pipeline_ready.parquet  [committed]
+Stage 1 (external): usdjpy_pipeline_creator.py  →  usdjpy_pipeline_ready.parquet & usdjpy_hourly_ohlc.csv  [committed]
 Stage 2:            sabr_calibration_jpy.py      →  usdjpy_features.parquet
 Stage 3:            rl_hedge_training_jpy.py     →  rl_metrics.csv, trained models
 
@@ -75,3 +75,4 @@ Python 3.11, CPU only (no GPU required).
 `usdjpy_pipeline_ready.parquet` contains daily vol surface data (ATM, 25-delta 
 and 10-delta risk reversals and butterflies across tenors), forward points, spot, 
 and bid/ask spreads. Source: Various
+`usdjpy_hourly_ohlc.csv` contains hourly quote tick data of usdjpy OHLC metrics. Source: Quotes from Various
