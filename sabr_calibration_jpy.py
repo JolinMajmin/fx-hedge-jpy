@@ -580,10 +580,13 @@ def run_pipeline(data_dir='.'):
         out['price_close'][d]    = pc
         out['n_legs'][d]         = nl
         out['n_cohorts'][d]      = len(set(l.cohort for l in legs if l.alive(d)))
-        out['continuity_pnl'][d] = cont_pnl
-        out['inception_pnl'][d]  = inception_pnl
-        out['expiry_pnl'][d]     = expiry_pnl
-        out['full_pnl'][d]       = cont_pnl + inception_pnl + expiry_pnl
+        # Convert option P&L from JPY to USD by dividing by spot_close.
+        # GK prices are in JPY per USD notional; dividing by Sc gives USD per USD notional.
+        # price_close retains JPY units (used internally for continuity diff only).
+        out['continuity_pnl'][d] = cont_pnl      / Sc
+        out['inception_pnl'][d]  = inception_pnl / Sc
+        out['expiry_pnl'][d]     = expiry_pnl    / Sc
+        out['full_pnl'][d]       = (cont_pnl + inception_pnl + expiry_pnl) / Sc
 
         for hr in HEDGE_HOURS:
             out[f'delta_{hr:02d}'][d] = delta_h[hr]
@@ -713,12 +716,12 @@ def run_pipeline(data_dir='.'):
     for hr in HEDGE_HOURS:
         lbl = hour_labels[hr]
         print(f"    Avg |delta| {lbl}:  {feat[f'port_delta_{hr:02d}'].abs().mean():.4f}", flush=True)
-    print(f"\n  P&L components:", flush=True)
-    print(f"    Mean |continuity_pnl|: {feat['port_continuity_pnl'].abs().mean():.4f}", flush=True)
-    print(f"    Mean |inception_pnl|:  {feat['port_inception_pnl'].abs().mean():.4f}", flush=True)
-    print(f"    Mean |expiry_pnl|:     {feat['port_expiry_pnl'].abs().mean():.6f}", flush=True)
-    print(f"    Mean |full_pnl|:       {feat['port_full_pnl'].abs().mean():.4f}", flush=True)
-    print(f"    Cumulative full_pnl:   {feat['port_full_pnl'].sum():.4f}", flush=True)
+    print(f"\n  P&L components (USD, per BASE_NOTIONAL USD notional):", flush=True)
+    print(f"    Mean |continuity_pnl|: {feat['port_continuity_pnl'].abs().mean():.6f}", flush=True)
+    print(f"    Mean |inception_pnl|:  {feat['port_inception_pnl'].abs().mean():.6f}", flush=True)
+    print(f"    Mean |expiry_pnl|:     {feat['port_expiry_pnl'].abs().mean():.8f}", flush=True)
+    print(f"    Mean |full_pnl|:       {feat['port_full_pnl'].abs().mean():.6f}", flush=True)
+    print(f"    Cum full_pnl (USD):    {feat['port_full_pnl'].sum():.4f}", flush=True)
     print(f"\n  Vol bumps active (days):", flush=True)
     for hr in HEDGE_HOURS:
         col = f'port_vol_bump_{hr:02d}'

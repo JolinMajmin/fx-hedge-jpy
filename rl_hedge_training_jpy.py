@@ -201,17 +201,19 @@ class FXHedgingEnv(gym.Env):
         else:
             full_option_pnl = option_pnl  # fallback: same as continuity
 
-        # Hedge P&L
-        carry_pnl   = H0 * (sc - sc_prev) if i > 0 else 0.0
-        trade00_pnl = dH00 * (sc - s00)
-        trade06_pnl = dH06 * (sc - s06)
-        trade16_pnl = dH16 * (sc - s16)
+        # Hedge P&L: each component divided by its execution spot to convert JPY → USD.
+        # dH × (sc - s_exec) is in JPY; dividing by s_exec gives USD return on delta units.
+        # carry P&L: H0 × (sc - sc_prev) / sc_prev — return on carried position in USD.
+        carry_pnl   = H0 * (sc - sc_prev) / sc_prev if i > 0 else 0.0
+        trade00_pnl = dH00 * (sc - s00) / s00 if s00 > 0 else 0.0
+        trade06_pnl = dH06 * (sc - s06) / s06 if s06 > 0 else 0.0
+        trade16_pnl = dH16 * (sc - s16) / s16 if s16 > 0 else 0.0
         hedge_pnl   = carry_pnl + trade00_pnl + trade06_pnl + trade16_pnl
 
-        # Transaction costs
-        tc00 = abs(dH00) * TC_BPS[0]  / 10000.0 * s00
-        tc06 = abs(dH06) * TC_BPS[6]  / 10000.0 * s06
-        tc16 = abs(dH16) * TC_BPS[16] / 10000.0 * s16
+        # Transaction costs in USD: bps × delta_units (spot cancels: JPY/10000 / JPY per USD)
+        tc00 = abs(dH00) * TC_BPS[0]  / 10000.0
+        tc06 = abs(dH06) * TC_BPS[6]  / 10000.0
+        tc16 = abs(dH16) * TC_BPS[16] / 10000.0
         tc   = tc00 + tc06 + tc16
 
         # hedge_error and daily_pnl use continuity_pnl (for HE vol metric and reward)
@@ -294,11 +296,12 @@ def run_benchmark(delta_16, price_close, spot_16, spot_close,
 
         full_opt_pnl = full_pnl[i] if full_pnl is not None else opt_pnl
 
-        carry_pnl = H * (sc - sc_prev) if i > 0 else 0.0
+        s16_i     = spot_16[i]
+        carry_pnl = H * (sc - sc_prev) / sc_prev if i > 0 else 0.0
         target    = -delta_16[i]
         dH        = target - H
-        trade_pnl = dH * (sc - spot_16[i])
-        tc        = abs(dH) * TC_BPS[16] / 10000.0 * spot_16[i]
+        trade_pnl = dH * (sc - s16_i) / s16_i if s16_i > 0 else 0.0
+        tc        = abs(dH) * TC_BPS[16] / 10000.0   # spot cancels in JPY/USD
         hedge_pnl = carry_pnl + trade_pnl
         hedge_error    = opt_pnl + hedge_pnl
         daily_pnl      = hedge_error - tc
@@ -861,9 +864,9 @@ def run_training(data_dir='.', total_timesteps=200_000, n_optuna_trials=20):
     if 'full_daily_pnl' in pd.concat(all_test).columns:
         rl_full_agg = pd.concat([r['full_daily_pnl'] for r in all_test]).sum()
         bm_full_agg = pd.concat([r['full_daily_pnl'] for r in all_bench]).sum()
-        logprint(f"\n  Full economic P&L (hedge P&L + inception premium):")
-        logprint(f"    RL cumulative: {rl_full_agg:.4f}")
-        logprint(f"    BM cumulative: {bm_full_agg:.4f}")
+        logprint(f"\n  Full economic P&L in USD (hedge + inception premium):")
+        logprint(f"    RL cumulative: {rl_full_agg:.4f} USD per USD notional")
+        logprint(f"    BM cumulative: {bm_full_agg:.4f} USD per USD notional")
 
     mdf = pd.DataFrame(all_metrics)
     logprint(f"\n  Per-window:")
