@@ -9,13 +9,13 @@ Produces:
     usdjpy_sabr_params.parquet      (daily SABR params per tenor, smoothed)
     usdjpy_features.parquet         (complete feature matrix for RL)
 
-Key differences from sabr_calibration.py (USD/ZAR, 2 hedge times):
-    - THREE hedge times per day: 00 UTC (9am Tokyo), 06 UTC (3pm Tokyo), 16 UTC
-    - Output columns: port_delta_00/06/16, port_gamma_00/06/16, port_price_00/06/16
-    - Spot snapshots: spot_00, spot_06, spot_16
-    - Hourly features: h00_*, h06_*, h16_* (replaces h12_*, h16_*)
-    - Forward point scale: Bloomberg JPY pips are already in FWD_* as actual JPY
-      (usdjpy_pipeline_creator.py divided raw pips by 100 before storing)
+P&L columns produced:
+    port_continuity_pnl  — daily MTM change of CONTINUING legs only (no inception/expiry).
+                           Used by RL reward: pure gamma P&L the agent can minimise.
+    port_inception_pnl   — premium paid (long) or received (short) when a new cohort starts.
+    port_expiry_pnl      — settlement minus last MTM when a cohort expires (usually ~0).
+    port_full_pnl        — complete economic daily P&L = continuity + inception + expiry.
+                           Used for strategy P&L reporting.
 
 Tokyo UTC equivalents (JST = UTC+9, Japan has NO daylight saving time):
     9am Tokyo  = 00:00 UTC
@@ -43,13 +43,12 @@ TENOR_ORDER = ['3M', '2M', '1M', '3W', '2W', '1W', 'ON']
 CALIBRATION_TENORS = ['3M', '2M', '1M', '1W']
 CAL_TENOR_YEARS = sorted([(TENOR_YEARS[t], t) for t in CALIBRATION_TENORS], reverse=True)
 
-# JPY-specific: 3 liquidity windows per day
 HEDGE_HOURS = [0, 6, 16]   # UTC: Tokyo open, Tokyo afternoon, London/NY
 
-BASE_NOTIONAL = 1_000_000
-VOL_SCALING   = 0.5
-EXPIRY_BDAYS  = 63
-ROLL_BDAYS    = 21
+BASE_NOTIONAL   = 1_000_000
+VOL_SCALING     = 0.5
+EXPIRY_BDAYS    = 63
+ROLL_BDAYS      = 21
 SPOT_VOL_WINDOW = 130
 SPOT_VOL_DECAY  = 0.98
 
@@ -107,8 +106,8 @@ def calibrate_sabr(S, F, T, sigma_atm, vol_25c, vol_25p, vol_10c, vol_10p):
 
     if best_res is None:
         return sigma_atm, 0.3, 0.5, 0.0, 99.0, False
-    rho_f  = np.clip(best_res.x[0], -0.999, 0.999)
-    nu_f   = np.clip(best_res.x[1], 0.001, 5.0)
+    rho_f   = np.clip(best_res.x[0], -0.999, 0.999)
+    nu_f    = np.clip(best_res.x[1], 0.001, 5.0)
     alpha_f = alpha_from_atm(sigma_atm, F, T, rho_f, nu_f)
     atm_err = sabr_vol_beta1(F, F, T, alpha_f, rho_f, nu_f) - sigma_atm
     rmse    = np.sqrt(best_obj / 4)
@@ -116,7 +115,6 @@ def calibrate_sabr(S, F, T, sigma_atm, vol_25c, vol_25p, vol_10c, vol_10p):
 
 
 def smooth_sabr_params(sabr_df, ew_alpha=0.8, spike_threshold=2.0):
-    """Interpolate gaps, remove spikes, EW-smooth rho and nu."""
     for tenor in sabr_df['tenor'].unique():
         mask = sabr_df['tenor'] == tenor
         for param in ['rho', 'nu']:
@@ -293,7 +291,6 @@ class Leg:
     def T_rem(self, d): return max((self.exp-d)/365.0, 1/365)
 
 def build_cohorts(pipe_df, dates):
-    """Build cohorts using 3M market vols at inception for strike computation."""
     n = len(dates)
     median_atm = pipe_df.loc[dates, 'ATM_1M'].median()
     legs, cid = [], 0
@@ -380,7 +377,8 @@ def run_pipeline(data_dir='.'):
     print("="*70, flush=True)
     print("STAGE 2 (JPY): SABR CALIBRATION + AGING PORTFOLIO + FEATURES", flush=True)
     print(f"  Hedge hours (UTC): {HEDGE_HOURS}  "
-          f"[{HEDGE_HOURS[0]:02d}=Tokyo open, {HEDGE_HOURS[1]:02d}=Tokyo PM, {HEDGE_HOURS[2]:02d}=London/NY]", flush=True)
+          f"[{HEDGE_HOURS[0]:02d}=Tokyo open, {HEDGE_HOURS[1]:02d}=Tokyo PM, {HEDGE_HOURS[2]:02d}=London/NY]",
+          flush=True)
     print("="*70, flush=True)
 
     # ── [1/7] Load ──────────────────────────────────────────────────────
@@ -446,7 +444,6 @@ def run_pipeline(data_dir='.'):
 
     hfeat = compute_hourly_features(hourly)
 
-    # Extract snapshots at each hedge hour
     snaps = {}
     for hr in HEDGE_HOURS:
         s = hfeat[hfeat.index.hour == hr].copy()
@@ -460,7 +457,6 @@ def run_pipeline(data_dir='.'):
     bd_v  = beta_down.values
     dstd  = np.log(pipe_df['SPOT']/pipe_df['SPOT'].shift(1)).rolling(20,min_periods=5).std().fillna(0.01).values
 
-    # Vectorized vol bumps for each hedge hour
     spot_open = np.roll(spot_c, 1); spot_open[0] = spot_c[0]
     vbump_h = {}
     for hr in HEDGE_HOURS:
@@ -469,9 +465,14 @@ def run_pipeline(data_dir='.'):
         beta_arr = np.where(ret_h > 0, bu_v, bd_v)
         vbump_h[hr] = np.where(sig_mask, np.clip(beta_arr * ret_h / 100, -0.05, 0.05), 0.0)
 
-    # Output arrays: close Greeks + per-hour Greeks + continuity P&L
+    # Output arrays
+    # continuity_pnl : MTM change of continuing legs only  → RL reward signal
+    # inception_pnl  : premium paid/received at cohort inception
+    # expiry_pnl     : settlement minus last MTM at cohort expiry (~0)
+    # full_pnl       : complete economic P&L = continuity + inception + expiry
     cols_float = (
-        ['delta_close','gamma_close','vega_close','price_close','continuity_pnl']
+        ['delta_close','gamma_close','vega_close','price_close',
+         'continuity_pnl','inception_pnl','expiry_pnl','full_pnl']
         + [f'delta_{hr:02d}' for hr in HEDGE_HOURS]
         + [f'gamma_{hr:02d}' for hr in HEDGE_HOURS]
         + [f'price_{hr:02d}' for hr in HEDGE_HOURS]
@@ -480,6 +481,11 @@ def run_pipeline(data_dir='.'):
     cols_int = ['n_legs', 'n_cohorts']
     out = {c: np.zeros(n) for c in cols_float}
     out.update({c: np.zeros(n, dtype=int) for c in cols_int})
+
+    # Pre-index legs by expiry day for O(1) expiry lookup
+    legs_expiring = {}
+    for l in legs:
+        legs_expiring.setdefault(l.exp, []).append(l)
 
     prev_leg_prices = {}
     t0 = time.time()
@@ -491,23 +497,19 @@ def run_pipeline(data_dir='.'):
 
         row = pipe_df.iloc[d]
         Sc  = spot_c[d]
-        So  = spot_c[d-1] if d > 0 else Sc  # previous close = today's "open"
 
         for hr in HEDGE_HOURS:
             out[f'vol_bump_{hr:02d}'][d] = vbump_h[hr][d]
 
-        # ── Close Greeks ──
         curr_leg_prices = {}
         dc, gc, vc, pc = 0., 0., 0., 0.
         nl = 0
-        cont_pnl = 0.0
+        cont_pnl      = 0.0
+        inception_pnl = 0.0   # premium paid (long) or received (short) today
 
-        # Per-hour accumulators
         delta_h = {hr: 0. for hr in HEDGE_HOURS}
         gamma_h = {hr: 0. for hr in HEDGE_HOURS}
         price_h = {hr: 0. for hr in HEDGE_HOURS}
-
-        # Cache bumped alpha per T_rem to avoid redundant solves
         bumped_alpha_cache = {hr: {} for hr in HEDGE_HOURS}
 
         for l in legs:
@@ -519,7 +521,6 @@ def run_pipeline(data_dir='.'):
 
             alpha_d, rho_d, nu_d = get_sabr_params(T, d, sabr_lookup)
 
-            # Close Greeks
             F_c    = get_forward(T, Sc, row)
             sig_c  = max(sabr_vol_beta1(l.K, F_c, T, alpha_d, rho_d, nu_d), 0.01)
             lp     = sign * w * gk_price(Sc, l.K, F_c, T, sig_c, l.is_call)
@@ -531,9 +532,14 @@ def run_pipeline(data_dir='.'):
             nl    += 1
 
             if leg_key in prev_leg_prices:
+                # Continuing leg: daily MTM change — pure gamma P&L for RL reward
                 cont_pnl += lp - prev_leg_prices[leg_key]
+            else:
+                # New leg incepted today: record inception premium cash flow.
+                # Long leg  (lp > 0): pay premium  → inception_pnl -= lp  (negative)
+                # Short leg (lp < 0): receive premium → inception_pnl -= lp (positive)
+                inception_pnl -= lp
 
-            # Per-hour Greeks (SABR with bumped ATM if significant intraday move)
             for hr in HEDGE_HOURS:
                 S_hr = spot_h[hr][d]
                 b_hr = vbump_h[hr][d]
@@ -547,11 +553,26 @@ def run_pipeline(data_dir='.'):
                     alpha_hr = bumped_alpha_cache[hr][T_key]
                     sig_hr   = max(sabr_vol_beta1(l.K, F_hr, T, alpha_hr, rho_d, nu_d), 0.01)
                 else:
-                    sig_hr   = max(sabr_vol_beta1(l.K, F_hr, T, alpha_d, rho_d, nu_d), 0.01)
+                    sig_hr = max(sabr_vol_beta1(l.K, F_hr, T, alpha_d, rho_d, nu_d), 0.01)
 
                 delta_h[hr] += sign * w * gk_delta(S_hr, l.K, F_hr, T, sig_hr, l.is_call)
                 gamma_h[hr] += sign * w * gk_gamma(S_hr, l.K, F_hr, T, sig_hr)
                 price_h[hr] += sign * w * gk_price(S_hr, l.K, F_hr, T, sig_hr, l.is_call)
+
+        # ── Expiry settlement ────────────────────────────────────────────
+        # Legs whose exp==d expired today. They were in prev_leg_prices but
+        # are no longer alive, so not in curr_leg_prices.
+        # settlement - last_MTM is typically near zero (last price ≈ intrinsic
+        # at T_rem=1/365), but compute explicitly for correctness.
+        expiry_pnl = 0.0
+        for l in legs_expiring.get(d, []):
+            leg_key = (l.cohort, l.K, l.is_call)
+            if leg_key in prev_leg_prices:
+                sign = np.sign(l.notional)
+                w    = abs(l.notional) / BASE_NOTIONAL
+                intrinsic  = max(Sc - l.K, 0.0) if l.is_call else max(l.K - Sc, 0.0)
+                settlement = sign * w * intrinsic
+                expiry_pnl += settlement - prev_leg_prices[leg_key]
 
         out['delta_close'][d]    = dc
         out['gamma_close'][d]    = gc
@@ -560,6 +581,9 @@ def run_pipeline(data_dir='.'):
         out['n_legs'][d]         = nl
         out['n_cohorts'][d]      = len(set(l.cohort for l in legs if l.alive(d)))
         out['continuity_pnl'][d] = cont_pnl
+        out['inception_pnl'][d]  = inception_pnl
+        out['expiry_pnl'][d]     = expiry_pnl
+        out['full_pnl'][d]       = cont_pnl + inception_pnl + expiry_pnl
 
         for hr in HEDGE_HOURS:
             out[f'delta_{hr:02d}'][d] = delta_h[hr]
@@ -575,42 +599,45 @@ def run_pipeline(data_dir='.'):
     n_big   = (np.abs(raw_pnl[1:] - cont[1:]) > 0.5).sum()
     print(f"  Continuity check: {n_big} cohort-roll days with gap>0.5", flush=True)
 
+    inc_vals = out['inception_pnl'][out['inception_pnl'] != 0]
+    exp_vals = out['expiry_pnl'][out['expiry_pnl'] != 0]
+    print(f"  Inception days: {len(inc_vals)}  "
+          f"mean|premium|={np.abs(inc_vals).mean():.4f}" if len(inc_vals) > 0
+          else "  Inception days: 0", flush=True)
+    print(f"  Expiry days:    {len(exp_vals)}  "
+          f"mean|settlement_residual|={np.abs(exp_vals).mean():.6f}" if len(exp_vals) > 0
+          else "  Expiry days: 0", flush=True)
+
     # ── [6/7] Build feature matrix ──────────────────────────────────────
     print("\n[6/7] Building feature matrix...", flush=True)
     feat = pd.DataFrame(index=dates)
 
-    # Vol surface
-    feat['atm_1m']          = pipe_df['ATM_1M']
-    feat['atm_1m_chg']      = pipe_df['ATM_1M'].diff()
-    feat['atm_3m']          = pipe_df['ATM_3M']
-    feat['atm_3m_chg']      = pipe_df['ATM_3M'].diff()
-    feat['term_slope_3m_1w']= pipe_df['ATM_3M'] - pipe_df['ATM_1W']
-    feat['rr25_1m']         = pipe_df['RR25_1M']
-    feat['rr25_1m_chg']     = pipe_df['RR25_1M'].diff()
-    feat['rr25_3m']         = pipe_df['RR25_3M']
-    feat['bf25_1m']         = pipe_df['BF25_1M']
-    feat['bf25_3m']         = pipe_df['BF25_3M']
+    feat['atm_1m']           = pipe_df['ATM_1M']
+    feat['atm_1m_chg']       = pipe_df['ATM_1M'].diff()
+    feat['atm_3m']           = pipe_df['ATM_3M']
+    feat['atm_3m_chg']       = pipe_df['ATM_3M'].diff()
+    feat['term_slope_3m_1w'] = pipe_df['ATM_3M'] - pipe_df['ATM_1W']
+    feat['rr25_1m']          = pipe_df['RR25_1M']
+    feat['rr25_1m_chg']      = pipe_df['RR25_1M'].diff()
+    feat['rr25_3m']          = pipe_df['RR25_3M']
+    feat['bf25_1m']          = pipe_df['BF25_1M']
+    feat['bf25_3m']          = pipe_df['BF25_3M']
 
-    # Spot
-    feat['spot_ret']        = np.log(pipe_df['SPOT']/pipe_df['SPOT'].shift(1))
-    feat['carry_3m']        = pipe_df['FWD_3M'] / pipe_df['SPOT']
-    feat['spread_bps']      = pipe_df['SPREAD_BPS']
+    feat['spot_ret']         = np.log(pipe_df['SPOT']/pipe_df['SPOT'].shift(1))
+    feat['carry_3m']         = pipe_df['FWD_3M'] / pipe_df['SPOT']
+    feat['spread_bps']       = pipe_df['SPREAD_BPS']
 
-    # Spot-vol
-    feat['beta_up']         = beta_up
-    feat['beta_down']       = beta_down
-    feat['rho_sv']          = rho_sv
+    feat['beta_up']          = beta_up
+    feat['beta_down']        = beta_down
+    feat['rho_sv']           = rho_sv
 
-    # Pre-computed Greeks (aging portfolio)
     for c in cols_float + cols_int:
         feat[f'port_{c}'] = out[c]
 
-    # Spot snapshots needed by RL environment
     feat['spot_close'] = spot_c
     for hr in HEDGE_HOURS:
         feat[f'spot_{hr:02d}'] = spot_h[hr]
 
-    # Hourly features at each hedge hour
     hour_labels = {0: 'h00', 6: 'h06', 16: 'h16'}
     for hr in HEDGE_HOURS:
         pfx = hour_labels[hr]
@@ -624,63 +651,51 @@ def run_pipeline(data_dir='.'):
             if rc in sr.columns:
                 feat[f'{pfx}_{rc}'] = sr[rc].ffill().bfill()
 
-    # ── New features (variance ratio, range position, regime, momentum) ──
     spot_log = np.log(pipe_df['SPOT'])
 
-    # Variance ratio: trending (>0) vs mean-reverting (<0)
     for win in [21, 63]:
         log_ret_sq = (spot_log - spot_log.shift(win))**2
         rv_sum     = (spot_log.diff()**2).rolling(win).sum()
         feat[f'vr_minus1_{win}d'] = (log_ret_sq - rv_sum) / (rv_sum + 1e-12)
 
-    # Range position: 0 = at rolling low, 1 = at rolling high
     for win in [21, 63]:
         roll_hi = pipe_df['SPOT'].rolling(win).max()
         roll_lo = pipe_df['SPOT'].rolling(win).min()
         feat[f'range_pos_{win}d'] = (pipe_df['SPOT'] - roll_lo) / (roll_hi - roll_lo + 1e-12)
 
-    # Vol MA alignment
-    atm     = pipe_df['ATM_1M']
-    ema_5   = atm.ewm(halflife=5).mean()
-    ema_21  = atm.ewm(halflife=21).mean()
-    ema_63  = atm.ewm(halflife=63).mean()
+    atm    = pipe_df['ATM_1M']
+    ema_5  = atm.ewm(halflife=5).mean()
+    ema_21 = atm.ewm(halflife=21).mean()
+    ema_63 = atm.ewm(halflife=63).mean()
     feat['vol_ma_alignment'] = (np.sign(ema_5 - ema_21) + np.sign(ema_21 - ema_63)) / 2
+    feat['vol_regime_63d']   = (atm / atm.rolling(63).mean() - 1).clip(-1, 1)
 
-    # Vol regime
-    feat['vol_regime_63d'] = (atm / atm.rolling(63).mean() - 1).clip(-1, 1)
-
-    # Discrete regime labels
     spot_vol_21 = spot_log.diff().rolling(21).std() * np.sqrt(252)
     feat['regime_highvol']  = (spot_vol_21 > spot_vol_21.rolling(252).quantile(0.75)).astype(float)
     feat['regime_trending'] = (feat['vr_minus1_21d'] > 0.1).astype(float)
     feat['regime_mean_rev'] = (feat['vr_minus1_21d'] < -0.2).astype(float)
 
-    # Spot momentum
     ret_21 = spot_log.diff(21)
     feat['spot_trend_strength'] = ret_21 / (spot_log.diff().rolling(21).std() + 1e-12)
 
-    # Tokyo-open-to-close lag (analogous to h12_to_close_lag1 for ZAR)
-    # Captures how much spot moved from Tokyo open to daily close on the PREVIOUS day
     feat['h00_to_close_lag1'] = (
         (pd.Series(spot_c, index=dates) - pd.Series(spot_h[0], index=dates))
         / (pd.Series(spot_h[0], index=dates) + 1e-12) * 10000
     ).shift(1)
 
-    # Intraday variance spread: Tokyo open vs close of same day (lagged)
     feat['tokyo_to_close_ret'] = (
         (pd.Series(spot_c, index=dates) - pd.Series(spot_h[0], index=dates))
         / (pd.Series(spot_h[0], index=dates) + 1e-12)
     ).shift(1)
 
-    # Trend slopes (standardized linear regression slope)
     atm_arr  = pipe_df['ATM_1M'].values.astype(np.float64)
     spot_arr = np.log(pipe_df['SPOT']).values.astype(np.float64)
     rr_arr   = pipe_df['RR25_1M'].values.astype(np.float64)
     ts_arr   = (pipe_df['ATM_3M'] - pipe_df['ATM_1W']).values.astype(np.float64)
-    feat['atm_slope_21d']       = calculate_slope_numba_standardized(atm_arr, 21)
-    feat['spot_slope_21d']      = calculate_slope_numba_standardized(spot_arr, 21)
-    feat['skew_slope_21d']      = calculate_slope_numba_standardized(rr_arr, 21)
-    feat['term_slope_slope_21d']= calculate_slope_numba_standardized(ts_arr, 21)
+    feat['atm_slope_21d']        = calculate_slope_numba_standardized(atm_arr, 21)
+    feat['spot_slope_21d']       = calculate_slope_numba_standardized(spot_arr, 21)
+    feat['skew_slope_21d']       = calculate_slope_numba_standardized(rr_arr, 21)
+    feat['term_slope_slope_21d'] = calculate_slope_numba_standardized(ts_arr, 21)
 
     feat = feat.ffill().bfill()
     feat.to_parquet(f'{data_dir}/usdjpy_features.parquet')
@@ -697,18 +712,18 @@ def run_pipeline(data_dir='.'):
     print(f"    Avg live legs:     {feat['port_n_legs'].mean():.1f}", flush=True)
     for hr in HEDGE_HOURS:
         lbl = hour_labels[hr]
-        d_hr = feat[f'port_delta_{hr:02d}'].abs().mean()
-        print(f"    Avg |delta| {lbl}:  {d_hr:.4f}", flush=True)
-    print(f"\n  Continuity P&L:", flush=True)
-    print(f"    Mean |cont_pnl|:   {np.abs(cont[1:]).mean():.4f}", flush=True)
-    print(f"    Mean |raw_pnl|:    {np.abs(raw_pnl[1:]).mean():.4f}", flush=True)
-    print(f"    Roll days (gap>0.5): {n_big}", flush=True)
+        print(f"    Avg |delta| {lbl}:  {feat[f'port_delta_{hr:02d}'].abs().mean():.4f}", flush=True)
+    print(f"\n  P&L components:", flush=True)
+    print(f"    Mean |continuity_pnl|: {feat['port_continuity_pnl'].abs().mean():.4f}", flush=True)
+    print(f"    Mean |inception_pnl|:  {feat['port_inception_pnl'].abs().mean():.4f}", flush=True)
+    print(f"    Mean |expiry_pnl|:     {feat['port_expiry_pnl'].abs().mean():.6f}", flush=True)
+    print(f"    Mean |full_pnl|:       {feat['port_full_pnl'].abs().mean():.4f}", flush=True)
+    print(f"    Cumulative full_pnl:   {feat['port_full_pnl'].sum():.4f}", flush=True)
     print(f"\n  Vol bumps active (days):", flush=True)
     for hr in HEDGE_HOURS:
         col = f'port_vol_bump_{hr:02d}'
         if col in feat.columns:
-            n_active = (feat[col] != 0).sum()
-            print(f"    {hour_labels[hr]} UTC: {n_active} days", flush=True)
+            print(f"    {hour_labels[hr]} UTC: {(feat[col]!=0).sum()} days", flush=True)
     print(f"\n{'='*70}", flush=True)
     print("STAGE 2 (JPY) COMPLETE", flush=True)
     print(f"{'='*70}", flush=True)
